@@ -2,18 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import * as poseDetection from "@tensorflow-models/pose-detection";
 import * as tf from "@tensorflow/tfjs";
 import "@tensorflow/tfjs-backend-webgl";
-import { GoogleGenAI } from "@google/genai";
-
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_KEY;
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-async function askGemini(message) {
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: message
-  });
-  return response.text;
-}
 
 export default function PoseCamera() {
   const videoRef = useRef(null);
@@ -26,6 +14,12 @@ export default function PoseCamera() {
   );
   const [score, setScore] = useState(100);
   const [videoSize, setVideoSize] = useState({ width: 960, height: 540 });
+  const formStatsRef = useRef({
+    angles: [],
+    stacks: [],
+    tilts: [],
+    lastFeedbackTime: Date.now()
+  });
 
   const repStateRef = useRef({
     phase: "top",
@@ -74,6 +68,45 @@ export default function PoseCamera() {
 
   function getPoint(pose, name) {
     return pose.keypoints.find((kp) => kp.name === name && kp.score > 0.4);
+  }
+
+  function calculateAngle(a, b, c) {
+    const ab = { x: a.x - b.x, y: a.y - b.y };
+    const cb = { x: c.x - b.x, y: c.y - b.y };
+    const dot = ab.x * cb.x + ab.y * cb.y;
+    const magAB = Math.hypot(ab.x, ab.y);
+    const magCB = Math.hypot(cb.x, cb.y);
+    if (!magAB || !magCB) return 180;
+    const cosine = Math.min(Math.max(dot / (magAB * magCB), -1), 1);
+    return (Math.acos(cosine) * 180) / Math.PI;
+  }
+
+  function interpretForm(averageElbowAngle, averageStack, shoulderTilt) {
+    let message = "Solid pushup - keep elbows tracking toward your ribs.";
+    let newScore = 100;
+
+    if (averageElbowAngle < 75) {
+      message = "Don't dive too deep - aim for about 90 deg at the elbows.";
+      newScore -= 20;
+    } else if (averageElbowAngle > 150) {
+      message = "Lower more; get elbows to roughly 90 deg for full range.";
+      newScore -= 15;
+    } else {
+      message = "Nice elbow bend - controlled 90 deg range.";
+    }
+
+    if (averageStack > 90) {
+      message = "Stack wrists under shoulders to avoid flaring the elbows.";
+      newScore -= 20;
+    }
+
+    if (shoulderTilt > 40) {
+      message = "Keep shoulders level; avoid twisting on the way up.";
+      newScore -= 15;
+    }
+
+    newScore = Math.max(60, Math.min(100, newScore));
+    return { message, score: newScore };
   }
 
   function drawSkeleton(pose) {
@@ -156,29 +189,54 @@ export default function PoseCamera() {
         state.topY = shoulderY;
         state.repCount += 1;
         setRepCount(state.repCount);
-        setFeedback("Strong rep! Keep that tempo steady.");
       }
     }
 
-    setScore(100);
-  }
+    const leftElbow = getPoint(pose, "left_elbow");
+    const rightElbow = getPoint(pose, "right_elbow");
+    const leftWrist = getPoint(pose, "left_wrist");
+    const rightWrist = getPoint(pose, "right_wrist");
 
-  let lastGeminiCall = 0;
+    if (leftShoulder && rightShoulder && leftElbow && rightElbow && leftWrist && rightWrist) {
+      const leftElbowAngle = calculateAngle(leftShoulder, leftElbow, leftWrist);
+      const rightElbowAngle = calculateAngle(rightShoulder, rightElbow, rightWrist);
+      const averageElbowAngle = (leftElbowAngle + rightElbowAngle) / 2;
+      const wristStackLeft = Math.abs(leftShoulder.x - leftWrist.x);
+      const wristStackRight = Math.abs(rightShoulder.x - rightWrist.x);
+      const averageStack = (wristStackLeft + wristStackRight) / 2;
+      const shoulderTilt = Math.abs(leftShoulder.y - rightShoulder.y);
 
-  async function sendToGemini(keypoints) {
+      formStatsRef.current.angles.push(averageElbowAngle);
+      formStatsRef.current.stacks.push(averageStack);
+      formStatsRef.current.tilts.push(shoulderTilt);
+    }
+
     const now = Date.now();
+    const elapsed = now - formStatsRef.current.lastFeedbackTime;
+    if (
+      elapsed >= 3000 &&
+      formStatsRef.current.angles.length > 0 &&
+      formStatsRef.current.stacks.length > 0 &&
+      formStatsRef.current.tilts.length > 0
+    ) {
+      const avgAngle =
+        formStatsRef.current.angles.reduce((sum, val) => sum + val, 0) /
+        formStatsRef.current.angles.length;
+      const avgStack =
+        formStatsRef.current.stacks.reduce((sum, val) => sum + val, 0) /
+        formStatsRef.current.stacks.length;
+      const avgTilt =
+        formStatsRef.current.tilts.reduce((sum, val) => sum + val, 0) /
+        formStatsRef.current.tilts.length;
 
-    if (now - lastGeminiCall < 1000) return; // limit to once per second
-    lastGeminiCall = now;
+      const form = interpretForm(avgAngle, avgStack, avgTilt);
+      setFeedback(form.message);
+      setScore(form.score);
 
-    try {
-      const input = JSON.stringify(keypoints);
-      const result = await askGemini(
-        "Here are MoveNet keypoints. Do not analyze pushup form. Just summarize what the user is doing: " + input
-      );
-      console.log("Gemini result:", result);
-    } catch (err) {
-      console.error("Gemini pose error:", err);
+      formStatsRef.current.angles = [];
+      formStatsRef.current.stacks = [];
+      formStatsRef.current.tilts = [];
+      formStatsRef.current.lastFeedbackTime = now;
     }
   }
 
@@ -190,7 +248,6 @@ export default function PoseCamera() {
           if (poses && poses.length > 0) {
             drawSkeleton(poses[0]);
             processPose(poses[0]);
-            sendToGemini(poses[0].keypoints);
           }
         } catch (err) {
           console.error("Pose estimation error:", err);
